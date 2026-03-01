@@ -10,6 +10,7 @@ import torchvision.io as io
 import torch
 from torchvision import datasets
 from torch.utils.data import Dataset, DataLoader
+from torchvision.datasets import CIFAR10
 import torch.nn as nn
 from torchsummary import summary
 from torch.optim import Adam
@@ -18,72 +19,30 @@ import matplotlib.pyplot as plt
 import numpy as np
 import time
 import os
+
 device = "mps" if torch.backends.mps.is_available() else 'cpu'
+N_EPOCHS = 10
+BATCH_SIZE = 16
+LR = 1e-3
+LOSS_FN = nn.CrossEntropyLoss()
 
-n_epochs = 5
-# I think this is how you set up the dataset, documentation was a little confusing
-class CIFAR10Dataset(root = "/Users/vfigueroa/Library/CloudStorage/OneDrive-BowdoinCollege/Desktop/Deep-Learning-Lab4/cifar-100-python", train = True, download = True):
-    def __init__(self, root, train):
-        self.data = datasets.CIFAR100(root=root, train=train, download=True)
-    def __getitem__(self, ix):
-        x, y = self.data[ix]
-        x = transforms.ToTensor()(x)
-        return x.to(device), torch.tensor(y).to(device)
-    def __len__(self):
-        return len(self.data)
-
-
-# todo
-def data_loader():
-    pass
-
-
-# need to preprocess data before we give to pre-trained models
-def apply_transformations(self):
-    pass
-
-def freeze_orginal_weights(model):
+def freeze_original_weights(model):
     for p in model.parameters():
         p.requires_grad = False
+    return model
 
-def build_mlp_model(in_features, num_classes=10):
+def build_mlp_model(num_classes=10):
     model = nn.Sequential(
-        nn.Linear(in_features, 512),
+        nn.Linear(512, 2048),
         nn.ReLU(),
-        nn.Dropout(0.2),
-        nn.Linear(512, num_classes)).to(device)
-    summary(model.to("cpu"), (1, 28*28))
+        nn.Dropout(0.25),
+        nn.Linear(2048, num_classes)).to(device)
+    summary(model.to("cpu"), (512,))
     model.to(device)
     return model
 
-# here we fine tune?
-def build_transfer_model(model,model_name, weights):
-    freeze_orginal_weights(model)
-    if model_name.startswith("vgg"):
-        print("TODO")
-    elif model_name.startswith("resnet"):
-        print("TODO")
-
-
-
-
-
-# the pretrained models
-vgg_model16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
-vgg_model13 = models.vgg13(weights=models.VGG13_Weights.IMAGENET1K_V1)
-resnet_model18 = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-resnet_model34 = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
-
-
-# These are the transformations, that we would apply to data
-vgg_model116_transformations = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).transforms()
-vgg_model113_transformations = models.vgg13(weights=models.VGG13_Weights.IMAGENET1K_V1).transforms()
-resnet_model118_transformations = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1).transforms()
-resnet_model134_transformations = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1).transforms()
-
-
-# From lab 3, we can reuse
-def train_batch(x, y, model, opt, loss_fn):
+# Training, accuracy, testing, and eval copied for Lab 3
+def train_batch(x, y, model, opt, loss_fn=LOSS_FN):
     model.train()
     opt.zero_grad()
     loss = loss_fn(model(x), y)
@@ -97,7 +56,7 @@ def accuracy_batch(x, y, model):
     preds = model(x).argmax(dim=1)
     return float((preds == y).float().mean().cpu())
 
-def train_model(model, train_dl, n_epochs=n_epochs, lr=lr):
+def train_model(model, model_name, train_dl, n_epochs=N_EPOCHS, loss_fn = LOSS_FN, lr=LR):
     loss_fn = nn.CrossEntropyLoss()
     opt = Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
 
@@ -124,7 +83,7 @@ def train_model(model, train_dl, n_epochs=n_epochs, lr=lr):
     return losses, accs, train_time
 
 @torch.no_grad()
-def test_model(model, test_dl):
+def test_model(model, model_name,test_dl):
     accs = []
     for x, y in test_dl:
         x, y = x.to(device), y.to(device)
@@ -147,9 +106,28 @@ def inference_time_per_image(model, sample_batch):
     return elapsed / x.shape[0]
 
 def main():
+    # VGG16
+    vgg16_weights=models.VGG16_Weights.IMAGENET1K_V1
+    vgg16_model = models.vgg16(weights=vgg16_weights)
+    print(vgg16_model)
+    vgg16_model_transformations = vgg16_weights.transforms()
+    
+    train_ds = CIFAR10(root="./data", train=True, download=True, transform=vgg16_model_transformations)
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    test_ds = CIFAR10(root="./data", train=False, download=True, transform=vgg16_model_transformations)
+    test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    # need a data loader since 
-    pass
+    vgg16_model = freeze_original_weights(vgg16_model)
+    vgg16_model.avgpool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
+    vgg16_model.classifier = build_mlp_model(num_classes=10)
+    # summary(vgg16_model.to("cpu"), (3, 224, 224))
+
+    # Train and test the model
+    vgg16_model = vgg16_model.to(device)
+    n_losses, n_accuracies,n_train_time = train_model(model=vgg16_model, model_name = "VGG16", train_dl=train_dl)
+    print(f"Training time: {n_train_time:.2f} seconds")
+    test_acc = test_model(model=vgg16_model, model_name="VGG16", test_dl=test_dl)
+    print(f"Test accuracy: {test_acc:.4f}")
 
 if __name__ == "__main__":
     main()
