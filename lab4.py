@@ -28,23 +28,6 @@ NEURONS = 1024
 LR = 1e-3
 LOSS_FN = nn.CrossEntropyLoss()
 
-def freeze_original_weights(model):
-    '''Freeze the weights of the original model to prevent them from being updated during training.'''
-    for p in model.parameters():
-        p.requires_grad = False
-    return model
-
-def build_mlp_model(num_classes=10):
-    '''Build a simple MLP model to replace the original classifier of the pre-trained model.'''
-    model = nn.Sequential(
-        nn.Linear(512, NEURONS),
-        nn.ReLU(),
-        nn.Dropout(0.25),
-        nn.Linear(NEURONS, num_classes)).to(device)
-    # summary(model.to("cpu"), (512,))
-    model.to(device)
-    return model
-
 # Training, accuracy, testing, and eval copied for Lab 3
 def train_batch(x, y, model, opt, loss_fn):
     model.train()
@@ -72,22 +55,17 @@ def train_model(model, model_name, train_dl):
     for epoch in range(N_EPOCHS):
         print(f"{model_name}: epoch {epoch + 1} of {N_EPOCHS}")
 
-        # Train and track train loss
+        # Train and track train loss and accuracy for the epoch
+        epoch_accuracies = []
         epoch_losses = []
         for x, y in train_dl:
             x = x.to(device)
             y = y.to(device)
             batch_loss = train_batch(x, y, model, opt, loss_fn)
             epoch_losses.append(batch_loss)
-        epoch_loss = float(np.mean(epoch_losses))
-
-        # Track train accuracy
-        epoch_accuracies = []
-        for x, y in train_dl:
-            x = x.to(device)
-            y = y.to(device)
             batch_acc = accuracy(x, y, model)
             epoch_accuracies.append(batch_acc)
+        epoch_loss = float(np.mean(epoch_losses))
         epoch_accuracy = float(np.mean(epoch_accuracies))
 
         losses.append(epoch_loss)
@@ -141,18 +119,52 @@ def inference_time_per_image(model, model_name, sample_batch):
     print(f"\nInference time per image for {model_name}: {elapsed / x.shape[0]:.6f} seconds")
     return elapsed / x.shape[0]
 
-def transfer_learning(model):
-    model = freeze_original_weights(model)
-    model.avgpool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
-    model.classifier = build_mlp_model(num_classes=10)
-    summary(model.to("cpu"), (3, 224, 224))
+def build_mlp_model(input_dim, num_classes=10):
+    '''Build a simple MLP model to replace the original classifier of the pre-trained model.'''
+    model = nn.Sequential(
+        nn.Linear(input_dim, NEURONS),
+        nn.ReLU(),
+        nn.Dropout(0.25),
+        nn.Linear(NEURONS, num_classes)).to(device)
+    # summary(model.to("cpu"), (input_dim,))
+    model.to(device)
     return model
+
+def get_conv_layers(model):
+   # Freeze entire model
+    model.eval()
+    model.to(device)
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # Collect convolutional layers
+    conv_layers = []
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d):
+            conv_layers.append(module)
+    return conv_layers
+
+@torch.no_grad()
+def run_conv_layers(dl, conv_layers):
+    print("\nRunning convolutional layers forward to extract features for the entire dataset")
+
+    # Run the convolutional layers forward once to extract features for the entire dataset
+    features = []
+    labels = []
+    for x, y in dl:
+        x = x.to(device)
+        forward_pass = conv_layers(x)                  # run CNN forward once
+        forward_pass = torch.flatten(forward_pass, start_dim=1)
+        features.append(forward_pass.cpu())
+        labels.append(y)
+    # This is the data we will train the MLP on
+    return torch.cat(features), torch.cat(labels)
 
 def create_dataset(model_transformations):
     train_ds = CIFAR10(root="./data", train=True, download=True, transform=model_transformations)
-    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
     test_ds = CIFAR10(root="./data", train=False, download=True, transform=model_transformations)
-    test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     return train_dl, test_dl
 
 def run_experiment(model, model_weights, model_name):
@@ -162,28 +174,53 @@ def run_experiment(model, model_weights, model_name):
     model_transformations = model_weights.transforms()
     train_dl, test_dl = create_dataset(model_transformations)
 
-    # Perform transfer learning and train the model
-    model = transfer_learning(model)
-    model = model.to(device)
-    n_losses, n_accuracies, n_train_time = train_model(model=model, model_name=model_name, train_dl=train_dl)
+    # Extract and freeze convolutional layers
+    conv_layers = get_conv_layers(model)
 
-    # Visualize training and evaluation results
+    # Run convolutional layers once to extract features using the pre-trained weights
+    train_features, train_labels = run_conv_layers(train_dl, conv_layers)
+    test_features, test_labels = run_conv_layers(test_dl, conv_layers)
+
+    # Create dataloaders for the newly extracted features to train the MLP classifier on
+    train_features_dataset = torch.utils.data.TensorDataset(train_features, train_labels)
+    train_dl = DataLoader(train_features_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    test_features_dataset = torch.utils.data.TensorDataset(test_features, test_labels)
+    test_dl = DataLoader(test_features_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    # Build MLP classifier 
+    input_dim = train_features.shape[1]
+    model = build_mlp_model(input_dim=input_dim, num_classes=10)
+    model = model.to(device)
+
+    # Train classifier
+    n_losses, n_accuracies, n_train_time = train_model(
+        model=model,
+        model_name=model_name,
+        train_dl=train_dl
+    )
+
+    # Visualize results
     visualize_training(losses=n_losses, accuracies=n_accuracies, model_name=model_name)
-    visualize_training_time(train_times=[n_train_time], model_names=[model_name], experiment_name="Transfer Learning")
-    # inference_time_per_image = inference_time_per_image(model=model, model_name=model_name, sample_batch=next(iter(test_dl)))
+    visualize_training_time(
+        train_times=[n_train_time],
+        model_names=[model_name],
+        experiment_name="Transfer Learning"
+    )
+
+    # Test classifier
     test_model(model=model, model_name=model_name, test_dl=test_dl)
 
 
 def main():
-    # VGG16
-    vgg16_weights=models.VGG16_Weights.IMAGENET1K_V1
-    vgg16_model = models.vgg16(weights=vgg16_weights)
-    run_experiment(model=vgg16_model, model_weights=vgg16_weights, model_name="VGG16")
+    # VGG11
+    vgg11_weights=models.VGG11_Weights.IMAGENET1K_V1
+    vgg11_model = models.vgg11(weights=vgg11_weights)
+    run_experiment(model=vgg11_model, model_weights=vgg11_weights, model_name="VGG11")
 
-    # # VGG19
-    # vgg19_weights=models.VGG19_Weights.IMAGENET1K_V1
-    # vgg19_model = models.vgg19(weights=vgg19_weights)
-    # run_experiment(model=vgg19_model, model_weights=vgg19_weights, model_name="VGG19")
+    # # VGG13
+    # vgg13_weights=models.VGG13_Weights.IMAGENET1K_V1
+    # vgg13_model = models.vgg13(weights=vgg13_weights)
+    # run_experiment(model=vgg13_model, model_weights=vgg13_weights, model_name="VGG13")
 
     #  # ResNet18
     # resnet18_weights=models.ResNet18_Weights.IMAGENET1K_V1
