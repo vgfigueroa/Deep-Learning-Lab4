@@ -4,11 +4,8 @@ Lab 4: Transfer Learning
 Prathit Kurup & Victoria Figueroa
 """
 
-from glob import glob
 import torchvision.transforms as transforms
-import torchvision.io as io
 import torch
-from torchvision import datasets
 from torch.utils.data import Dataset, DataLoader
 from torchvision.datasets import CIFAR10
 import torch.nn as nn
@@ -18,25 +15,30 @@ from torchvision import models
 import matplotlib.pyplot as plt
 import numpy as np
 import time
-import os
 
 # Declare global variables for training and evaluation
-device = "mps" if torch.backends.mps.is_available() else 'cpu'
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
 N_EPOCHS = 10
 BATCH_SIZE = 64
-NEURONS = 1024
+NEURONS = 2048
 LR = 1e-3
 LOSS_FN = nn.CrossEntropyLoss()
 
 # Training, accuracy, testing, and eval copied for Lab 3
 def train_batch(x, y, model, opt, loss_fn):
-    model.train()
-    opt.zero_grad() # Flush memory
-    batch_loss = loss_fn(model(x), y) # Compute loss
-    batch_loss.backward() # Compute gradients
-    opt.step() # Make a GD step
-    return batch_loss.detach().cpu()
-    
+    # Updated train batch function to return the loss and predictions for the batch
+
+    model.train()                       # Set model to training mode
+    opt.zero_grad()                     # Flush memory
+    outputs = model(x)                  # Forward pass
+    batch_loss = loss_fn(outputs, y)    # Compute loss
+    batch_loss.backward()               # Compute gradients
+    opt.step()                          # Make a GD step
+    preds = outputs.argmax(dim=1)       # Get predicted class labels
+
+    return batch_loss.detach().cpu(), preds.detach()
+
 @torch.no_grad()
 def accuracy(x, y, model):
     model.eval()
@@ -54,19 +56,20 @@ def train_model(model, model_name, train_dl):
     print(f"\nBegin training for: {model_name}")
     for epoch in range(N_EPOCHS):
         print(f"{model_name}: epoch {epoch + 1} of {N_EPOCHS}")
-
-        # Train and track train loss and accuracy for the epoch
-        epoch_accuracies = []
         epoch_losses = []
+        correct = 0
+        total = 0
+
         for x, y in train_dl:
             x = x.to(device)
             y = y.to(device)
-            batch_loss = train_batch(x, y, model, opt, loss_fn)
-            epoch_losses.append(batch_loss)
-            batch_acc = accuracy(x, y, model)
-            epoch_accuracies.append(batch_acc)
+            batch_loss, preds = train_batch(x, y, model, opt, loss_fn)
+            epoch_losses.append(batch_loss.item())
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+
         epoch_loss = float(np.mean(epoch_losses))
-        epoch_accuracy = float(np.mean(epoch_accuracies))
+        epoch_accuracy = correct / total
 
         losses.append(epoch_loss)
         accuracies.append(epoch_accuracy)
@@ -74,7 +77,7 @@ def train_model(model, model_name, train_dl):
 
     end_time = time.time()
     train_time = end_time - start_time
-    print("Training time (seconds): ", train_time)
+    print("MLP training time (seconds): ", train_time)
     return losses, accuracies, train_time
 
 @torch.no_grad()
@@ -94,14 +97,6 @@ def visualize_training(losses, accuracies, model_name):
     plt.subplot(122)
     plt.title(f'{model_name}: Training Accuracy')
     plt.plot(np.arange(N_EPOCHS) + 1, accuracies)
-    plt.show()
-
-def visualize_training_time(train_times, model_names, experiment_name):
-    print(f"\nVisualizing training time for {experiment_name}")
-    plt.figure(figsize=(8,5))
-    plt.title(f'{experiment_name} Training Time (per model)')
-    plt.bar(model_names, train_times)
-    plt.ylabel('Time (seconds)')
     plt.show()
 
 @torch.no_grad()
@@ -126,86 +121,81 @@ def build_mlp_model(input_dim, num_classes=10):
         nn.ReLU(),
         nn.Dropout(0.25),
         nn.Linear(NEURONS, num_classes)).to(device)
-    # summary(model.to("cpu"), (input_dim,))
-    model.to(device)
+    # summary(model, (input_dim,), device="cpu")
     return model
 
-def get_conv_layers(model):
-   # Freeze entire model
-    model.eval()
-    model.to(device)
-    for p in model.parameters():
-        p.requires_grad = False
-
-    # Collect convolutional layers
-    conv_layers = []
-    for module in model.modules():
-        if isinstance(module, nn.Conv2d):
-            conv_layers.append(module)
-    return conv_layers
-
 @torch.no_grad()
-def run_conv_layers(dl, conv_layers):
-    print("\nRunning convolutional layers forward to extract features for the entire dataset")
+def run_conv_layers(dl, model):
+    print("Extracting features using frozen backbone...")
 
-    # Run the convolutional layers forward once to extract features for the entire dataset
+    model.eval()
+    # Run convolutional layers once to extract features using the pre-trained weights
     features = []
     labels = []
     for x, y in dl:
         x = x.to(device)
-        forward_pass = conv_layers(x)                  # run CNN forward once
-        forward_pass = torch.flatten(forward_pass, start_dim=1)
-        features.append(forward_pass.cpu())
+        outputs = model(x)      # run CNN forward once
+        outputs = torch.flatten(outputs, start_dim=1)
+        features.append(outputs.detach().cpu())
         labels.append(y)
     # This is the data we will train the MLP on
     return torch.cat(features), torch.cat(labels)
 
+def freeze_backbone(model):
+    # Freeze the backbone
+    model.to(device)
+    # model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
 def create_dataset(model_transformations):
     train_ds = CIFAR10(root="./data", train=True, download=True, transform=model_transformations)
-    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
     test_ds = CIFAR10(root="./data", train=False, download=True, transform=model_transformations)
-    test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
     return train_dl, test_dl
 
 def run_experiment(model, model_weights, model_name):
-    print(f"\nRunning experiment for {model_name}\n")
+    print(f"\nRunning experiment for {model_name}")
 
     # Create dataset and dataloaders using the transformations associated with the pre-trained model
     model_transformations = model_weights.transforms()
     train_dl, test_dl = create_dataset(model_transformations)
 
-    # Extract and freeze convolutional layers
-    conv_layers = get_conv_layers(model)
+    # model = freeze_backbone(model)
 
-    # Run convolutional layers once to extract features using the pre-trained weights
-    train_features, train_labels = run_conv_layers(train_dl, conv_layers)
-    test_features, test_labels = run_conv_layers(test_dl, conv_layers)
+    # Remove classifier depending on architecture
+    if hasattr(model, "classifier"):    # VGG
+        model.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        model.classifier = nn.Identity()
+    elif hasattr(model, "fc"):          # ResNet
+        model.fc = nn.Identity()
 
-    # Create dataloaders for the newly extracted features to train the MLP classifier on
+    # Freeze backbone parameters to prevent training and save memory
+    for param in model.parameters():
+        param.requires_grad = False
+    model = model.to(device)
+    model.eval()
+
+    # Run convlutional layers once to extract features using the pre-trained weights
+    train_features, train_labels = run_conv_layers(train_dl, model)
+    test_features, test_labels = run_conv_layers(test_dl, model)
+
+    # Create dataloaders for the newly extracted features as the input to train the MLP classifier
     train_features_dataset = torch.utils.data.TensorDataset(train_features, train_labels)
     train_dl = DataLoader(train_features_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_features_dataset = torch.utils.data.TensorDataset(test_features, test_labels)
     test_dl = DataLoader(test_features_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # Build MLP classifier 
+    # Build MLP classifier and train on the extracted features
     input_dim = train_features.shape[1]
     model = build_mlp_model(input_dim=input_dim, num_classes=10)
-    model = model.to(device)
-
-    # Train classifier
-    n_losses, n_accuracies, n_train_time = train_model(
-        model=model,
-        model_name=model_name,
-        train_dl=train_dl
-    )
+    n_losses, n_accuracies, n_train_time = train_model(model=model, model_name=model_name, train_dl=train_dl)
 
     # Visualize results
     visualize_training(losses=n_losses, accuracies=n_accuracies, model_name=model_name)
-    visualize_training_time(
-        train_times=[n_train_time],
-        model_names=[model_name],
-        experiment_name="Transfer Learning"
-    )
+    print(f"Training time for {model_name}: {n_train_time:.2f} seconds")
 
     # Test classifier
     test_model(model=model, model_name=model_name, test_dl=test_dl)
