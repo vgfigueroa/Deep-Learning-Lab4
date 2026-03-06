@@ -8,13 +8,17 @@ import torchvision.transforms as transforms
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.datasets import CIFAR10
+from torchvision import datasets
 import torch.nn as nn
+from torchvision.io import read_image
 from torchsummary import summary
 from torch.optim import Adam
 from torchvision import models
 import matplotlib.pyplot as plt
 import numpy as np
+from glob import glob
 import time
+import os
 
 # Declare global variables for training and evaluation
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -24,6 +28,12 @@ BATCH_SIZE = 64
 NEURONS = 2048
 LR = 1e-3
 LOSS_FN = nn.CrossEntropyLoss()
+google_paths = ["/content/gdrive/MyDrive/googleimages/cat/cat1.jpg",
+  "/content/gdrive/MyDrive/googleimages/cat/cat2.jpg",
+  "/content/gdrive/MyDrive/googleimages/dog/dog1.jpg",
+  "/content/gdrive/MyDrive/googleimages/dog/dog2.jpg",
+  "/content/gdrive/MyDrive/googleimages/frog/frog1.jpg",
+  "/content/gdrive/MyDrive/googleimages/frog/frog2.jpg"]
 
 # Training, accuracy, testing, and eval copied for Lab 3
 def train_batch(x, y, model, opt, loss_fn):
@@ -99,21 +109,6 @@ def visualize_training(losses, accuracies, model_name):
     plt.plot(np.arange(N_EPOCHS) + 1, accuracies)
     plt.show()
 
-@torch.no_grad()
-def inference_time_per_image(model, model_name, sample_batch):
-    """
-    Measure one forward pass and divide by batch size.
-    """
-    model.eval()
-    x, _ = sample_batch
-    x = x.to(device)
-
-    start = time.time()
-    _ = model(x)
-    elapsed = time.time() - start
-    print(f"\nInference time per image for {model_name}: {elapsed / x.shape[0]:.6f} seconds")
-    return elapsed / x.shape[0]
-
 def build_mlp_model(input_dim, num_classes=10):
     '''Build a simple MLP model to replace the original classifier of the pre-trained model.'''
     model = nn.Sequential(
@@ -128,6 +123,7 @@ def build_mlp_model(input_dim, num_classes=10):
 def run_conv_layers(dl, model):
     print("Extracting features using frozen backbone...")
 
+    start_time = time.time()
     model.eval()
     # Run convolutional layers once to extract features using the pre-trained weights
     features = []
@@ -138,6 +134,11 @@ def run_conv_layers(dl, model):
         outputs = torch.flatten(outputs, start_dim=1)
         features.append(outputs.detach().cpu())
         labels.append(y)
+
+    end_time = time.time()
+    extraction_time = end_time - start_time
+    print("CNN feature extraction time (seconds): ", extraction_time)
+
     # This is the data we will train the MLP on
     return torch.cat(features), torch.cat(labels)
 
@@ -156,71 +157,176 @@ def create_dataset(model_transformations):
     test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
     return train_dl, test_dl
 
+def extract_vgg_features(vgg, x):
+    feats = vgg.features(x)   # CNN feature extractor
+    feats = torch.flatten(feats, 1)      # [B, C*H*W]
+    return feats
+def extract_resnet_features(resnet, x):
+    feats = resnet.conv1(x)
+    feats = resnet.bn1(feats)
+    feats = resnet.relu(feats)
+    feats = resnet.maxpool(feats)
+    feats = resnet.layer1(feats)
+    feats = resnet.layer2(feats)
+    feats = resnet.layer3(feats)
+    feats = resnet.layer4(feats)
+    feats = resnet.avgpool(feats)
+    feats = torch.flatten(feats, 1) # [B, C*H*W]
+    return feats
+
+@torch.no_grad()
+def predict_and_show_google_images(backbone, mlp, weights, image_paths, model_name):
+    backbone.eval().to(device)
+    mlp.eval().to(device)
+
+    class_names = datasets.CIFAR10(root="./data", train=False, download=True).classes
+    preprocess = weights.transforms()
+
+    for path in image_paths:
+        img = read_image(path)  # [C,H,W], uint8 0..255
+
+        # Convert 4-channel RGBA to 3-channel RGB if necessary
+        if img.shape[0] == 4:
+            img = img[:3, :, :]
+
+        plt.figure(figsize=(3,3))
+        plt.imshow(img.permute(1,2,0))
+        plt.axis("off")
+
+        # Preprocess for model
+        x = preprocess(img)            # [C,224,224] normalized
+        x = x.unsqueeze(0).to(device)  # [1,3,224,224]
+
+        # Forward backbone + mlp
+        feats = backbone(x)
+        feats = torch.flatten(feats, 1)
+        logits = mlp(feats)
+        pred = logits.argmax(dim=1).item()
+
+        plt.title(f"{model_name}\nPred: {class_names[pred]}\n{os.path.basename(path)}")
+        plt.show()
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters())
+
+
 def run_experiment(model, model_weights, model_name):
     print(f"\nRunning experiment for {model_name}")
 
-    # Create dataset and dataloaders using the transformations associated with the pre-trained model
+    # Dataset using the correct preprocessing
     model_transformations = model_weights.transforms()
     train_dl, test_dl = create_dataset(model_transformations)
 
-    # model = freeze_backbone(model)
-
-    # Remove classifier depending on architecture
-    if hasattr(model, "classifier"):    # VGG
-        model.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+    # Remove classifier from backbone
+    if hasattr(model, "classifier"):     # VGG
+        model.avgpool = nn.AdaptiveAvgPool2d((1,1))
         model.classifier = nn.Identity()
-    elif hasattr(model, "fc"):          # ResNet
+
+    elif hasattr(model, "fc"):           # ResNet
         model.fc = nn.Identity()
 
-    # Freeze backbone parameters to prevent training and save memory
-    for param in model.parameters():
-        param.requires_grad = False
-    model = model.to(device)
-    model.eval()
+    backbone = model.to(device)
 
-    # Run convlutional layers once to extract features using the pre-trained weights
-    train_features, train_labels = run_conv_layers(train_dl, model)
-    test_features, test_labels = run_conv_layers(test_dl, model)
+    # Freeze backbone
+    for p in backbone.parameters():
+        p.requires_grad = False
 
-    # Create dataloaders for the newly extracted features as the input to train the MLP classifier
-    train_features_dataset = torch.utils.data.TensorDataset(train_features, train_labels)
-    train_dl = DataLoader(train_features_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_features_dataset = torch.utils.data.TensorDataset(test_features, test_labels)
-    test_dl = DataLoader(test_features_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    backbone.eval()
 
-    # Build MLP classifier and train on the extracted features
+    train_features, train_labels = run_conv_layers(train_dl, backbone)
+    test_features, test_labels = run_conv_layers(test_dl, backbone)
+
+    train_dataset = torch.utils.data.TensorDataset(train_features, train_labels)
+    train_dl = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    test_dataset = torch.utils.data.TensorDataset(test_features, test_labels)
+    test_dl = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    # Build MLP classifier
     input_dim = train_features.shape[1]
-    model = build_mlp_model(input_dim=input_dim, num_classes=10)
-    n_losses, n_accuracies, n_train_time = train_model(model=model, model_name=model_name, train_dl=train_dl)
+    mlp = build_mlp_model(input_dim=input_dim, num_classes=10).to(device)
 
-    # Visualize results
-    visualize_training(losses=n_losses, accuracies=n_accuracies, model_name=model_name)
-    print(f"Training time for {model_name}: {n_train_time:.2f} seconds")
+    # Train classifier
+    losses, accuracies, train_time = train_model(
+        model=mlp,
+        model_name=model_name,
+        train_dl=train_dl
+    )
 
-    # Test classifier
-    test_model(model=model, model_name=model_name, test_dl=test_dl)
+    # Inference timing
+    p = google_paths[0]
+    img = read_image(p)
+    x = model_weights.transforms()(img).unsqueeze(0).to(device)
+    backbone.eval()
+    mlp.eval()
+    with torch.no_grad():
+      if device == "cuda": torch.cuda.synchronize()
+      t0 = time.time()
+      feats = torch.flatten(backbone(x), 1); _ = mlp(feats)
+    print(f"\nInference time per image for {model_name}: {(time.time()-t0):.6f} seconds")
+
+    # Visualization
+    visualize_training(losses, accuracies, model_name)
+    print(f"Training time for {model_name}: {train_time:.2f} seconds")
+
+    # Test accuracy
+    test_model(mlp, model_name, test_dl)
+
+    backbone_params = count_parameters(backbone)
+    mlp_params = count_parameters(mlp)
+    print(f"Total parameters in {model_name} backbone: {backbone_params}")
+    print(f"Total parameters in {model_name} MLP: {mlp_params}")
+
+    # return for google images test
+    return backbone, mlp
 
 
 def main():
     # VGG11
-    vgg11_weights=models.VGG11_Weights.IMAGENET1K_V1
+    vgg11_weights = models.VGG11_Weights.IMAGENET1K_V1
     vgg11_model = models.vgg11(weights=vgg11_weights)
-    run_experiment(model=vgg11_model, model_weights=vgg11_weights, model_name="VGG11")
 
-    # # VGG13
-    # vgg13_weights=models.VGG13_Weights.IMAGENET1K_V1
-    # vgg13_model = models.vgg13(weights=vgg13_weights)
-    # run_experiment(model=vgg13_model, model_weights=vgg13_weights, model_name="VGG13")
+    vgg11_backbone, vgg11_mlp = run_experiment(
+        model=vgg11_model,
+        model_weights=vgg11_weights,
+        model_name="VGG11"
+    )
+    predict_and_show_google_images(vgg11_backbone, vgg11_mlp, vgg11_weights, google_paths, "VGG11")
 
-    #  # ResNet18
-    # resnet18_weights=models.ResNet18_Weights.IMAGENET1K_V1
-    # resnet18_model = models.resnet18(weights=resnet18_weights)
-    # run_experiment(model=resnet18_model, model_weights=resnet18_weights, model_name="ResNet18")
+    # VGG13
+    vgg13_weights = models.VGG13_Weights.IMAGENET1K_V1
+    vgg13_model = models.vgg13(weights=vgg13_weights)
 
-    #  # ResNet34
-    # resnet34_weights=models.ResNet34_Weights.IMAGENET1K_V1
-    # resnet34_model = models.resnet34(weights=resnet34_weights)
-    # run_experiment(model=resnet34_model, model_weights=resnet34_weights, model_name="ResNet34")
+    vgg13_backbone, vgg13_mlp = run_experiment(
+        model=vgg13_model,
+        model_weights=vgg13_weights,
+        model_name="VGG13"
+    )
+    predict_and_show_google_images(vgg13_backbone, vgg13_mlp, vgg13_weights, google_paths, "VGG13")
+
+
+    # ResNet18
+    resnet18_weights = models.ResNet18_Weights.IMAGENET1K_V1
+    resnet18_model = models.resnet18(weights=resnet18_weights)
+
+    resnet18_backbone, resnet18_mlp = run_experiment(
+        model=resnet18_model,
+        model_weights=resnet18_weights,
+        model_name="ResNet18"
+    )
+    predict_and_show_google_images(resnet18_backbone, resnet18_mlp, resnet18_weights, google_paths, "ResNet18")
+
+    # ResNet34
+    resnet34_weights = models.ResNet34_Weights.IMAGENET1K_V1
+    resnet34_model = models.resnet34(weights=resnet34_weights)
+
+    resnet34_backbone, resnet34_mlp = run_experiment(
+        model=resnet34_model,
+        model_weights=resnet34_weights,
+        model_name="ResNet34"
+    )
+    predict_and_show_google_images(resnet34_backbone, resnet34_mlp, resnet34_weights, google_paths, "ResNet34")
+
 
 if __name__ == "__main__":
-    main()
+  main()
